@@ -1,0 +1,167 @@
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SQL-код: витрина «Своевременность доставки»</title>
+<style>body{margin:0;background:#f3f2ef;color:#0b0b0b;font:15px/1.5 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}.w{max-width:980px;margin:0 auto;padding:28px 20px}h1{font-size:22px;margin:0 0 6px}p{color:#52514e;margin:0 0 14px}nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}nav a{background:#fff;border:1px solid #e4e3df;border-radius:99px;padding:4px 12px;color:#2a78d6;text-decoration:none;font-size:13px}section{background:#fcfcfb;border:1px solid #e4e3df;border-radius:12px;padding:16px 18px;margin-bottom:16px}h2{font-size:16px;margin:0}.fn{color:#8a8984;font-size:12px;margin:2px 0 8px}pre{margin:0;overflow:auto;background:#1a1a19;color:#f0efec;border-radius:8px;padding:14px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace}</style></head>
+<body><div class="w"><h1>SQL-код: витрина «Своевременность доставки»</h1><p>PostgreSQL 16. Витрина: одна строка = отделение × день отправки, с 01.01.2021. Порядок запуска: 01 → 02 → 03; файл 04 — запросы карточек для Metabase.</p><nav><a href="#01">01_schema.sql</a><a href="#02">02_load.sql</a><a href="#03">03_mart_delivery_ontime.sql</a><a href="#04">04_metabase_cards.sql</a></nav><section id="01"><h2>Схема исходных таблиц</h2><div class="fn">sql/01_schema.sql</div><pre><code>-- 01_schema.sql — исходные таблицы (PostgreSQL). Даты в CSV имеют формат дд.мм.гггг.
+SET datestyle = &#x27;ISO, DMY&#x27;;
+
+DROP TABLE IF EXISTS delivery_times, orders, delivery_status, departments CASCADE;
+
+CREATE TABLE departments (
+    department_id   integer PRIMARY KEY,
+    department_name varchar(255)            -- у отделений 199 и 200 название в источнике пустое
+);
+
+CREATE TABLE delivery_status (
+    status_id integer PRIMARY KEY,           -- 1 delivered, 2 declined, 3 in_transit
+    status    varchar(255) NOT NULL
+);
+
+-- ВАЖНО: order_id в источнике НЕ уникален: 57 номеров встречаются дважды у разных отделений,
+-- а для двух пар (362381/37 и 375904/187) совпадает даже отделение. Поэтому ключ заказа в витрине —
+-- пара (order_id, department_id), а неоднозначные пары исключаются (см. 03_mart_delivery_ontime.sql).
+-- В «сырых» таблицах первичный ключ по этой паре поставить нельзя.
+CREATE TABLE orders (
+    order_id      integer NOT NULL,
+    department_id integer NOT NULL REFERENCES departments,
+    order_date    date    NOT NULL,
+    delivery_date date,                      -- NULL, если не доставлен (в пути или отказ)
+    status_id     integer NOT NULL REFERENCES delivery_status
+);
+CREATE INDEX ON orders (order_id, department_id);
+
+CREATE TABLE delivery_times (
+    department_id integer NOT NULL REFERENCES departments,
+    order_id      integer NOT NULL,
+    deadline_date date    NOT NULL           -- крайний срок доставки
+);
+CREATE INDEX ON delivery_times (order_id, department_id);
+</code></pre></section><section id="02"><h2>Загрузка CSV</h2><div class="fn">sql/02_load.sql</div><pre><code>-- 02_load.sql — загрузка CSV (psql, из папки проекта). Порядок важен из-за внешних ключей.
+SET datestyle = &#x27;ISO, DMY&#x27;;
+\copy departments     FROM &#x27;data/departments.csv&#x27;     WITH (FORMAT csv, HEADER true)
+\copy delivery_status FROM &#x27;data/delivery_status.csv&#x27; WITH (FORMAT csv, HEADER true)
+\copy orders          FROM &#x27;data/orders.csv&#x27;          WITH (FORMAT csv, HEADER true)
+\copy delivery_times  FROM &#x27;data/delivery_times.csv&#x27;  WITH (FORMAT csv, HEADER true)
+SELECT (SELECT count(*) FROM departments) deps, (SELECT count(*) FROM orders) orders, (SELECT count(*) FROM delivery_times) times;
+</code></pre></section><section id="03"><h2>Витрина mart_delivery_ontime (основной SQL-запрос)</h2><div class="fn">sql/03_mart_delivery_ontime.sql</div><pre><code>-- 03_mart_delivery_ontime.sql
+-- Витрина «Своевременность доставки»: одна строка = отделение × день отправки (order_date)
+-- Период: с 01.01.2021. Показатели: отправлено, доставлено (вовремя/с опозданием), отказы, в пути, % вовремя.
+--
+-- Бизнес-правила:
+--   * день витрины — дата заказа/отправления из отделения (order_date);
+--   * «вовремя» = заказ доставлен (status_id = 1) и delivery_date &lt;= deadline_date;
+--   * on_time_pct = доставлено вовремя / доставлено (в знаменателе только доставленные:
+--     заказы «в пути» ещё не оценить, «отказы» — не вина срока доставки, их доля вынесена отдельно);
+--   * строки есть только для дней, когда из отделения были отправления (пустые дни BI заполняет сам).
+--   * order_id в источнике не уникален, поэтому заказы соединяются по паре (order_id, department_id);
+--     2 пары (4 заказа из 9999) повторяются даже внутри отделения с разными датами, а в delivery_times
+--     нет даты заказа, чтобы однозначно подобрать срок — они исключены из витрины.
+
+DROP TABLE IF EXISTS mart_delivery_ontime;
+
+CREATE TABLE mart_delivery_ontime AS
+WITH uniq_orders AS (      -- пары, которые однозначно соединяются с delivery_times
+    SELECT order_id, department_id FROM orders         GROUP BY 1, 2 HAVING count(*) = 1
+    INTERSECT
+    SELECT order_id, department_id FROM delivery_times GROUP BY 1, 2 HAVING count(*) = 1
+), base AS (
+    SELECT o.order_date,
+           o.department_id,
+           o.status_id,
+           o.delivery_date,
+           t.deadline_date
+    FROM orders o
+    JOIN delivery_times t
+      ON t.order_id = o.order_id
+     AND t.department_id = o.department_id
+    JOIN uniq_orders u
+      ON u.order_id = o.order_id
+     AND u.department_id = o.department_id
+    WHERE o.order_date &gt;= DATE &#x27;2021-01-01&#x27;
+), as_of AS (
+    SELECT max(order_date) AS as_of_date FROM orders      -- «сегодня» для данных выгрузки
+)
+SELECT b.order_date                                                       AS report_date,
+       b.department_id,
+       COALESCE(d.department_name, &#x27;Отделение №&#x27; || b.department_id)      AS department_name,
+       count(*)                                                           AS orders_total,
+       count(*) FILTER (WHERE b.status_id = 1)                            AS delivered_cnt,
+       count(*) FILTER (WHERE b.status_id = 1 AND b.delivery_date &lt;= b.deadline_date) AS delivered_on_time_cnt,
+       count(*) FILTER (WHERE b.status_id = 1 AND b.delivery_date &gt;  b.deadline_date) AS delivered_late_cnt,
+       count(*) FILTER (WHERE b.status_id = 2)                            AS declined_cnt,
+       count(*) FILTER (WHERE b.status_id = 3)                            AS in_transit_cnt,
+       count(*) FILTER (WHERE b.status_id = 3 AND b.deadline_date &lt; a.as_of_date) AS in_transit_overdue_cnt,
+       round(100.0 * count(*) FILTER (WHERE b.status_id = 1 AND b.delivery_date &lt;= b.deadline_date)
+             / NULLIF(count(*) FILTER (WHERE b.status_id = 1), 0), 1)     AS on_time_pct
+FROM base b
+CROSS JOIN as_of a
+JOIN departments d ON d.department_id = b.department_id
+GROUP BY b.order_date, b.department_id, d.department_name
+ORDER BY b.order_date, b.department_id;
+
+ALTER TABLE mart_delivery_ontime ADD PRIMARY KEY (report_date, department_id);
+COMMENT ON TABLE mart_delivery_ontime IS &#x27;Витрина: своевременность доставки по отделениям и дням (с 2021-01-01)&#x27;;
+</code></pre></section><section id="04"><h2>Запросы карточек дашборда Metabase</h2><div class="fn">sql/04_metabase_cards.sql</div><pre><code>-- 04_metabase_cards.sql — запросы карточек дашборда Metabase (источник — витрина mart_delivery_ontime)
+-- Переменные — Field Filter:
+--   {{department}} → mart_delivery_ontime.department_name (Dropdown list)
+--   {{report_date}} → mart_delivery_ontime.report_date    (Date: All options / диапазон)
+-- Важно: % вовремя считаем как sum(вовремя)/sum(доставлено), а НЕ как среднее по дневным процентам.
+
+-- === Карточка 1. Доставлено вовремя, % (Number) ===
+SELECT round(100.0 * sum(delivered_on_time_cnt) / NULLIF(sum(delivered_cnt), 0), 1) AS &quot;Вовремя, %&quot;
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]];
+
+-- === Карточка 2. Отправлений за период (Number) ===
+SELECT sum(orders_total) AS &quot;Отправлений&quot;
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]];
+
+-- === Карточка 3. Сейчас в пути (Number; период не учитывается — это состояние «на данный момент») ===
+SELECT sum(in_transit_cnt) AS &quot;В пути&quot;, sum(in_transit_overdue_cnt) AS &quot;из них просрочено&quot;
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]];
+
+-- === Карточка 4. Своевременность по месяцам (Line; X = month, Y = on_time_pct) ===
+SELECT date_trunc(&#x27;month&#x27;, report_date)::date AS month,
+       round(100.0 * sum(delivered_on_time_cnt) / NULLIF(sum(delivered_cnt), 0), 1) AS on_time_pct
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+GROUP BY 1
+ORDER BY 1;
+
+-- === Карточка 5. Отправления по месяцам (Bar; X = month, Y = orders) ===
+SELECT date_trunc(&#x27;month&#x27;, report_date)::date AS month,
+       sum(orders_total) AS orders
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+GROUP BY 1
+ORDER BY 1;
+
+-- === Карточка 6. Отправления в пути по отделениям (Table) ===
+SELECT department_name       AS &quot;Отделение&quot;,
+       sum(in_transit_cnt)         AS &quot;В пути&quot;,
+       sum(in_transit_overdue_cnt) AS &quot;Просрочено&quot;,
+       min(report_date) FILTER (WHERE in_transit_cnt &gt; 0) AS &quot;Самый старый заказ&quot;
+FROM mart_delivery_ontime
+WHERE 1=1 [[AND {{department}}]]
+GROUP BY department_name
+HAVING sum(in_transit_cnt) &gt; 0
+ORDER BY 3 DESC, 2 DESC
+LIMIT 20;
+
+-- === Карточка 7. Чем заканчиваются отправления (Bar; X = outcome, Y = orders) ===
+-- Рейтинг отделений по % вовремя намеренно не строим: при ~27 доставках на отделение
+-- различия между ними статистически неотличимы от случайных (хи-квадрат, p = 0,24).
+SELECT outcome, orders FROM (
+  SELECT 1 AS ord, &#x27;Доставлено вовремя&#x27; AS outcome, sum(delivered_on_time_cnt) AS orders
+    FROM mart_delivery_ontime WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+  UNION ALL
+  SELECT 2, &#x27;Доставлено с опозданием&#x27;, sum(delivered_late_cnt)
+    FROM mart_delivery_ontime WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+  UNION ALL
+  SELECT 3, &#x27;Отказ&#x27;, sum(declined_cnt)
+    FROM mart_delivery_ontime WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+  UNION ALL
+  SELECT 4, &#x27;В пути&#x27;, sum(in_transit_cnt)
+    FROM mart_delivery_ontime WHERE 1=1 [[AND {{department}}]] [[AND {{report_date}}]]
+) x ORDER BY ord;
+</code></pre></section></div></body></html>
